@@ -1,0 +1,53 @@
+PHASE 2: Build, push, deploy the app
+1. Docker Hub username
+
+Edit Jenkinsfile (Phase 2), replace DOCKERHUB_USERNAME_PLACEHOLDER with your real username.
+
+2. Add two Jenkins credentials
+
+dockerhub-creds (Username with password)
+
+Docker Hub → Account Settings → Security → New Access Token
+Jenkins → Manage Jenkins → Credentials → Add Credentials → Username/password → ID: dockerhub-creds
+
+k3s-kubeconfig (Secret file)
+
+bash
+scp -i <key>.pem ubuntu@<k3s_node_public_ip>:/etc/rancher/k3s/k3s.yaml ./kubeconfig.yaml
+
+Edit kubeconfig.yaml: change server: https://127.0.0.1:6443 → server: https://<k3s_node_public_ip>:6443 (use the public IP, not private — see Troubleshooting)
+
+Jenkins → Manage Jenkins → Credentials → Add Credentials → Secret file → upload kubeconfig.yaml → ID: k3s-kubeconfig
+
+3. Create the Jenkins job
+
+Same as Phase 1 — Pipeline script from SCM, Script Path Jenkinsfile.
+
+4. Run it
+
+Build Now. Check console: Checkout → Build → Push → Deploy.
+
+5. Verify
+bash
+curl http://<k3s_node_public_ip>:30080
+curl http://<k3s_node_public_ip>:30080/health
+Important: re-run after every cluster recreation
+
+Every time Phase 1's cluster is destroyed and recreated, the node gets a new IP. Before re-running Phase 2:
+
+Re-fetch the kubeconfig with the new IP (step 2 above)
+Re-upload it to the k3s-kubeconfig Jenkins credential
+Troubleshooting — issues we actually hit, and the fixes
+Symptom	Cause	Fix
+SignatureDoesNotMatch on terraform plan	Bad/rotated AWS access key	Regenerate key in IAM, re-run aws configure
+InvalidParameterCombination: instance type not eligible for Free Tier	Account's free tier uses t3.micro, not t2.micro	Check with aws ec2 describe-instance-types --filters Name=free-tier-eligible,Values=true, update instance_type
+kubectl get nodes → TLS handshake timeout, but sudo k3s kubectl get nodes on the node works	1GB RAM on t3.micro gets fully consumed, no swap	Add swap (fallocate + mkswap + swapon) — already baked into user_data_k3s.sh
+Jenkins git fetch fails: couldn't find remote ref refs/heads/master	Repo's actual branch is main, Jenkins configured for master	Job Configure → Branches to build → */main
+terraform plan -var=my_ip_cidr= (empty)	Jenkinsfile parameters defaulted to blank on first "Build Now"	Remove -var flags from Jenkinsfile, rely on variables.tf defaults instead
+kubectl apply → dial tcp ...: i/o timeout (with node's public IP)	Security group only allowed VPC-internal or your home IP, not Jenkins' IP	Add explicit ingress rule for Jenkins' public IP on port 6443
+Same timeout even using the node's private IP	Jenkins and the k3s node are in different AWS regions (us-east-1 vs ap-south-1) — private IPs don't route across regions without VPC peering	Use the node's public IP instead, with Jenkins' public IP explicitly allowed in the security group
+failed to download openapi: ... i/o timeout	kubectl's client-side schema validation call, separate from the actual apply	Add --validate=false to kubectl apply commands
+Cost control
+Free tier: 750 hrs/month combined across t2.micro/t3.micro instances (12 months from account creation)
+Destroy the k3s cluster via Jenkins (DESTROY param) when not actively working
+Don't destroy the Jenkins box — stop/start it instead if needed
