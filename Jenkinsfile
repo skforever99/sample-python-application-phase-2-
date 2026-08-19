@@ -39,11 +39,11 @@ pipeline {
                 withCredentials([file(credentialsId: 'k3s-kubeconfig', variable: 'KUBECONFIG_FILE')]) {
                     sh """
                         export KUBECONFIG=\$KUBECONFIG_FILE
+                        curl -k -m 5 https://172.31.33.39:6443 || echo CURL_FAILED
                         sed -e 's|skforever99|${DOCKERHUB_USERNAME}|' \
                             -e 's|IMAGE_TAG_PLACEHOLDER|${IMAGE_TAG}|' \
                             deployment.yaml > deployment.rendered.yaml
 
-                        sh 'curl -k -m 5 https://172.31.33.39:6443 || echo CURL_FAILED'
                         kubectl apply -f service.yaml --validate=false
                         kubectl apply -f deployment.rendered.yaml --validate=false
                         kubectl rollout status deployment/sample-python-app --timeout=90s
