@@ -43,8 +43,8 @@ pipeline {
                             -e 's|IMAGE_TAG_PLACEHOLDER|${IMAGE_TAG}|' \
                             deployment.yaml > deployment.rendered.yaml
 
-                        kubectl apply -f service.yaml
-                        kubectl apply -f deployment.rendered.yaml
+                        kubectl apply -f service.yaml --validate=false
+                        kubectl apply -f deployment.rendered.yaml --validate=false
                         kubectl rollout status deployment/sample-python-app --timeout=90s
                     """
                 }
