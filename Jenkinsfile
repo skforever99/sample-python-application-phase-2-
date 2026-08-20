@@ -14,9 +14,32 @@ pipeline {
             }
         }
 
+        stage('SonarCloud Scan') {
+            steps {
+                withCredentials([string(credentialsId: 'sonarcloud-token', variable: 'SONAR_TOKEN')]) {
+                    sh """
+                        docker run --rm \
+                            -e SONAR_TOKEN=\$SONAR_TOKEN \
+                            -v \$(pwd):/usr/src \
+                            -w /usr/src \
+                            sonarsource/sonar-scanner-cli
+                    """
+                }
+            }
+        }
+
         stage('Build Docker Image') {
             steps {
                 sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} -t ${IMAGE_NAME}:latest ."
+            }
+        }
+
+        stage('Trivy Scan') {
+            steps {
+                sh """
+                    trivy image --severity HIGH,CRITICAL --exit-code 1 \
+                        --format table ${IMAGE_NAME}:${IMAGE_TAG}
+                """
             }
         }
 
@@ -39,8 +62,7 @@ pipeline {
                 withCredentials([file(credentialsId: 'k3s-kubeconfig', variable: 'KUBECONFIG_FILE')]) {
                     sh """
                         export KUBECONFIG=\$KUBECONFIG_FILE
-                        curl -k -m 5 https://172.31.33.39:6443 || echo CURL_FAILED
-                        sed -e 's|skforever99|${DOCKERHUB_USERNAME}|' \
+                        sed -e 's|DOCKERHUB_USERNAME_PLACEHOLDER|${DOCKERHUB_USERNAME}|' \
                             -e 's|IMAGE_TAG_PLACEHOLDER|${IMAGE_TAG}|' \
                             deployment.yaml > deployment.rendered.yaml
 
