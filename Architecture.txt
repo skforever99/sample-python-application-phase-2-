@@ -1,0 +1,174 @@
+# DevSecOps CI/CD Pipeline — Phases 1, 2 & 3
+
+**Phase 1:** Terraform (via Jenkins) provisions a k3s Kubernetes cluster on a free-tier EC2 instance.
+**Phase 2:** A sample Flask app is built into a Docker image, pushed to Docker Hub, and deployed onto that cluster — via Jenkins.
+**Phase 3:** SonarCloud (code quality gate) and Trivy (image vulnerability gate) are added as pipeline stages, both capable of failing the build.
+
+---
+
+## Architecture
+
+```
+GitHub repo
+    │
+    ▼
+Jenkins (EC2, us-east-1)
+    │
+    ├── Phase 1 pipeline: terraform init/plan/apply → creates k3s node (EC2, ap-south-1)
+    │
+    └── Phase 2+3 pipeline:
+          Cleanup old images
+          → Checkout
+          → SonarCloud Scan (source code)
+          → Build Docker Image
+          → Trivy Scan (built image)
+          → Push to Docker Hub
+          → Deploy to k3s
+```
+
+Jenkins and the k3s node are in **different AWS regions** (us-east-1 vs ap-south-1) — this matters for networking, see Troubleshooting.
+
+---
+
+## Repo structure
+
+```
+main.tf                    # Terraform: security group + k3s EC2 instance
+variables.tf                 # my_ip_cidr, key_name, jenkins_ip_cidr, instance_type
+user_data_k3s.sh              # Installs k3s + 2GB swap on first boot
+Jenkinsfile (Phase 1)          # create/destroy the cluster
+
+app.py / requirements.txt        # Flask app
+Dockerfile                        # python:3.12-alpine based
+deployment.yaml / service.yaml      # K8s manifests (NodePort 30080)
+sonar-project.properties             # SonarCloud project config
+Jenkinsfile (Phase 2+3)               # build, scan, push, deploy
+```
+
+---
+
+## PHASE 1: Provision the cluster
+
+### IAM permissions (attach to local user AND Jenkins EC2 role)
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "ec2:Describe*", "ec2:RunInstances", "ec2:TerminateInstances",
+      "ec2:CreateSecurityGroup", "ec2:DeleteSecurityGroup",
+      "ec2:AuthorizeSecurityGroupIngress", "ec2:AuthorizeSecurityGroupEgress",
+      "ec2:RevokeSecurityGroupIngress", "ec2:RevokeSecurityGroupEgress",
+      "ec2:CreateTags", "ec2:DeleteTags"
+    ],
+    "Resource": "*"
+  }]
+}
+```
+
+### variables.tf
+```hcl
+my_ip_cidr       = "<your_home_ip>/32"
+key_name         = "<your_aws_key_pair_name>"
+jenkins_ip_cidr  = "<jenkins_ec2_public_ip>/32"
+instance_type    = "t3.micro"
+```
+
+### Create / Destroy via Jenkins
+- **Create/update infra:** Build (DESTROY unchecked)
+- **Tear down:** Build with Parameters → check `DESTROY`
+
+---
+
+## PHASE 2: Build, push, deploy the app
+
+### Docker Hub credentials (`dockerhub-creds`)
+Docker Hub → Security → New Access Token → Jenkins → Credentials → Username/password.
+
+### k3s kubeconfig (`k3s-kubeconfig`)
+```bash
+scp -i <key>.pem ubuntu@<k3s_node_public_ip>:/etc/rancher/k3s/k3s.yaml ./kubeconfig.yaml
+```
+Edit: `server: https://127.0.0.1:6443` → `server: https://<k3s_node_public_ip>:6443`
+Upload as Secret file credential, ID `k3s-kubeconfig`.
+
+**⚠️ Re-fetch fresh, every time the cluster is recreated.** Don't edit an old copy — a
+recreated cluster gets a brand new CA certificate, so an old kubeconfig becomes permanently
+invalid even if you fix the IP. Always pull a new file from the node.
+
+---
+
+## PHASE 3: SonarCloud + Trivy
+
+### SonarCloud setup
+1. sonarcloud.io → Log in with GitHub → Analyze new project → select repo
+2. **Administration → Analysis Method → disable "Automatic Analysis"**, use CI-based instead
+   (SonarCloud enables Automatic by default; it conflicts with pipeline-driven scans)
+3. My Account → Security → Generate Token → save it
+4. Fill `sonar-project.properties` with your Organization Key + Project Key
+5. Jenkins → Credentials → Secret text → ID `sonarcloud-token`
+
+### Trivy setup (on the Jenkins EC2, NOT the k3s node)
+```bash
+sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+sudo apt-get update && sudo apt-get install -y trivy
+```
+
+### Base image choice
+Went through two changes chasing fewer CVEs and a smaller footprint:
+`python:3.12-slim` (Debian trixie, new/unpatched CVEs) → `python:3.12-slim-bookworm` (Debian 12,
+mature patching) → **`python:3.12-alpine`** (final choice — smallest size, fewest CVEs).
+
+### If Trivy fails your build
+Expected on first runs. Temporarily loosen to see the report without blocking:
+```
+trivy image --severity HIGH,CRITICAL --exit-code 0 --format table ${IMAGE_NAME}:${IMAGE_TAG}
+```
+Switch back to `--exit-code 1` once you've reviewed findings.
+
+---
+
+## Troubleshooting — real issues hit, and their fixes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `SignatureDoesNotMatch` on `terraform plan` | Bad/rotated AWS access key | Regenerate in IAM, re-run `aws configure` |
+| `instance type not eligible for Free Tier` | Account's free tier uses `t3.micro`, not `t2.micro` | `aws ec2 describe-instance-types --filters Name=free-tier-eligible,Values=true` |
+| `kubectl` TLS timeout, but `k3s kubectl` on the node works | 1GB RAM fully consumed, no swap | Add swap (baked into `user_data_k3s.sh`, now 2GB) |
+| Jenkins `git fetch` fails: no `refs/heads/master` | Repo's branch is `main`, job configured for `master` | Job Configure → Branches to build → `*/main` |
+| `terraform plan -var=my_ip_cidr=` (empty) | Jenkins param defaulted to blank on first "Build Now" | Removed `-var` flags, rely on `variables.tf` defaults |
+| `kubectl apply` timeout using node's PUBLIC IP | SG only allowed VPC-internal + home IP, not Jenkins' IP | Added explicit ingress rule for Jenkins' public IP |
+| Same timeout using node's PRIVATE IP | **Jenkins and k3s node are in different AWS regions** — private IPs don't route cross-region without VPC peering | Use node's public IP + Jenkins' public IP allowed in SG |
+| `x509: certificate signed by unknown authority` | kubeconfig was from an OLDER cluster incarnation (stale CA) | Always re-fetch kubeconfig fresh after any cluster recreation |
+| Jenkins → node timeout after IP was "already fixed" | **Jenkins' own public IP changed** (no Elastic IP, restarted) | Update `jenkins_ip_cidr` in `variables.tf` to Jenkins' current IP |
+| Repeated confusion debugging the "wrong" box | Jenkins EC2 and k3s EC2 private IPs look similar (`172.31.x.x`), easy to SSH into the wrong one | Always check `hostname` + `docker --version` (only Jenkins has Docker) before running any fix |
+| `no space left on device` (Docker pull) | Jenkins EC2's small root volume (started at 6.7GB) filled from repeated image builds | `docker system prune -af --volumes`, then resized EBS volume to 20GB (`growpart` + `resize2fs`) |
+| Disk fills again despite `docker system df` showing 0 | SonarCloud scanner re-downloaded its JRE/plugins every run — no persistent cache | Mounted `$HOME/.sonar-cache` into the scanner container in the Jenkinsfile |
+| `EXECUTION FAILURE ... Automatic Analysis is enabled` | SonarCloud's default project setup enables Automatic Analysis, conflicting with CI-based scans | Project → Administration → Analysis Method → disable Automatic |
+| `failed to download openapi: ... i/o timeout` | kubectl's client-side schema validation call, separate from the actual apply | Added `--validate=false` to `kubectl apply` |
+| `TLS handshake timeout` deploying, node's SSH also failing | k3s node genuinely under memory pressure (deep into swap) | Rebooted node; upgraded swap from 1GB → 2GB |
+| High CVE count from Trivy | `python:3.12-slim` resolved to Debian trixie (new, unpatched backlog) | Switched to `python:3.12-alpine` |
+
+---
+
+## Cost control
+- Free tier: 750 hrs/month combined across `t2.micro`/`t3.micro` (12 months from account creation); EBS: 30GB combined
+- Destroy the k3s cluster via Jenkins `DESTROY` param when not actively working
+- Run `docker system prune -af --volumes` on Jenkins periodically, or rely on the pipeline's
+  auto-cleanup stage (removes images older than 24h)
+- If memory pressure recurs even with 2GB swap, that's the signal to size up to `t3.small`
+  rather than keep patching — free tier is a starting point, not a hard ceiling to defend forever
+
+---
+
+## What this project demonstrates (for resume/interview framing)
+- Infrastructure as Code (Terraform) triggered via CI/CD (Jenkins), not run ad hoc
+- Containerization (Docker) and container orchestration (Kubernetes/k3s)
+- Shift-left security: SAST (SonarCloud) and container vulnerability scanning (Trivy), both as
+  actual pipeline gates, not just reports nobody reads
+- Real-world debugging across networking (cross-region, security groups), resource constraints
+  (memory, disk), and credential/cert lifecycle management (kubeconfig staleness, IP drift) —
+  the kind of operational experience that doesn't show up in a tutorial that "just works"
